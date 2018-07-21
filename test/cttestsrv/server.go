@@ -65,6 +65,9 @@ type IntegrationSrv struct {
 	sth *ct.SignedTreeHead
 	// sthFetches tracks how many times get-sth has been called
 	sthFetches int64
+
+	// TODO(@cpu): Comment, consider better name?
+	log *testLog
 }
 
 // NewServer creates an IntegrationSrv instance with the given Personality,
@@ -83,6 +86,10 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	if err != nil {
 		return nil, err
 	}
+	testLog, err := newLog(key, pubKeyBytes)
+	if err != nil {
+		return nil, err
+	}
 	is := &IntegrationSrv{
 		logger:          logger,
 		Addr:            p.Addr,
@@ -92,6 +99,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 		server: &http.Server{
 			Addr: p.Addr,
 		},
+		log: testLog,
 	}
 	mux := http.NewServeMux()
 	// ct handlers
@@ -144,6 +152,11 @@ func (is *IntegrationSrv) addChain(chain []string, precert bool) ([]byte, error)
 	}
 
 	is.sleep()
+	err := is.log.addChain(chain, precert)
+	if err != nil {
+		return nil, err
+	}
+
 	atomic.AddInt64(&is.submissions, 1)
 	return createTestingSignedSCT(chain, is.key, precert, time.Now()), nil
 }
@@ -225,7 +238,14 @@ func (is *IntegrationSrv) getSTHHandler(w http.ResponseWriter, r *http.Request) 
 
 	is.RLock()
 	defer is.RUnlock()
-	response, err := json.Marshal(&is.sth)
+
+	curSTHResp, err := is.log.getSTH()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response, err := json.Marshal(&curSTHResp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
