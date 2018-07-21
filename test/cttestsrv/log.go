@@ -2,7 +2,9 @@ package cttestsrv
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -161,7 +163,7 @@ func (t *testLog) getSTH() (*ct.GetSTHResponse, error) {
 	}
 
 	hash := sha256.Sum256(sthBytes)
-	signature, err := t.signer.Sign(hash[:])
+	signature, err := t.key.Sign(rand.Reader, hash[:], crypto.SHA256)
 	if err != nil {
 		return nil, err
 	}
