@@ -191,6 +191,7 @@ func (is *IntegrationSrv) addChainHandler(w http.ResponseWriter, r *http.Request
 	start := time.Now()
 	sct, err := is.addChain(addChainReq.Chain, precert)
 	if err != nil {
+		fmt.Printf("ERROR: %#v\n", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

@@ -209,9 +209,11 @@ func (t *testLog) addChain(req []string, precert bool) error {
 		return err
 	}
 
-	fmt.Printf("The MerkleTreeLeaf is: %#v\n", leaf)
-	fmt.Printf("The TimestampedEntry is: %#v\n", leaf.TimestampedEntry)
-	fmt.Printf("The X509Entry is: %#v\n", leaf.TimestampedEntry.X509Entry)
+	/*
+		fmt.Printf("The MerkleTreeLeaf is: %#v\n", leaf)
+		fmt.Printf("The TimestampedEntry is: %#v\n", leaf.TimestampedEntry)
+		fmt.Printf("The X509Entry is: %#v\n", leaf.TimestampedEntry.X509Entry)
+	*/
 
 	// TODO(@cpu): Should use a better prefix here for the logging done by
 	// util.BuildLogLeaf. Maybe the bind addr? Pubkey?
@@ -221,22 +223,24 @@ func (t *testLog) addChain(req []string, precert bool) error {
 		fmt.Printf("Err: %#v\n", err)
 		return err
 	}
-	fmt.Printf("The LogLeaf is: %#v\n", logLeaf)
+	//fmt.Printf("The LogLeaf is: %#v\n", logLeaf)
 
 	leafHash, err := t.hasher.HashLeaf(logLeaf.LeafValue)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("The LogLeaf hash is: %#v\n", leafHash)
+	logLeaf.MerkleLeafHash = leafHash
+	logLeaf.LeafIdentityHash = logLeaf.MerkleLeafHash
+	//fmt.Printf("The LogLeaf hash is: %#v\n", leafHash)
 
 	leaves := []*trillian.LogLeaf{&logLeaf}
-	fmt.Printf("Leaves: %#v\n", leaves)
+	//fmt.Printf("Leaves: %#v\n", leaves)
 
 	resp, err := t.logStorage.QueueLeaves(context.Background(), t.tree, leaves, timeSource.Now())
 	if err != nil {
 		return err
 	}
-	fmt.Printf("QueueLeaves resp: %#v\n", resp)
+	fmt.Printf("queued %d leaves\n", len(resp))
 
 	maxRootDuration, err := ptypes.Duration(t.tree.MaxRootDuration)
 	if err != nil {
