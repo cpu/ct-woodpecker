@@ -94,10 +94,12 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 		},
 	}
 	mux := http.NewServeMux()
+	// ct handlers
 	mux.HandleFunc("/ct/v1/add-pre-chain", is.addChainHandler)
 	mux.HandleFunc("/ct/v1/add-chain", is.addChainHandler)
-	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/ct/v1/get-sth", is.getSTHHandler)
+	// management handlers
+	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/set-sth", is.setSTHHandler)
 	mux.HandleFunc("/sth-fetches", is.getSTHFetchesHandler)
 	is.server.Handler = mux
