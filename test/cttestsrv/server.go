@@ -108,6 +108,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	mux.HandleFunc("/ct/v1/add-chain", is.addChainHandler)
 	mux.HandleFunc("/ct/v1/get-sth", is.getSTHHandler)
 	mux.HandleFunc("/ct/v1/get-sth-consistency", is.getConsistencyHandler)
+	mux.HandleFunc("/ct/v1/get-entries", is.getEntriesHandler)
 	// management handlers
 	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/set-sth", is.setSTHHandler)
@@ -372,6 +373,60 @@ func (is *IntegrationSrv) getConsistencyHandler(w http.ResponseWriter, r *http.R
 	elapsed := time.Since(start)
 	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
 
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "%s", response)
+}
+
+func (is *IntegrationSrv) getEntriesHandler(w http.ResponseWriter, r *http.Request) {
+	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
+	startTime := time.Now()
+
+	startArgs, ok := r.URL.Query()["start"]
+	if !ok || len(startArgs) < 1 {
+		http.Error(w, "no start parameter", http.StatusBadRequest)
+		return
+	}
+	endArgs, ok := r.URL.Query()["end"]
+	if !ok || len(endArgs) < 1 {
+		http.Error(w, "no end parameter", http.StatusBadRequest)
+		return
+	}
+
+	start, err := strconv.ParseInt(startArgs[0], 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	end, err := strconv.ParseInt(endArgs[0], 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	is.logger.Printf("Getting entries from %d to %d (%d entries)", start, end, (end - start))
+
+	entries, err := is.log.getEntries(start, end)
+	if err != nil {
+		fmt.Printf("!!! GetEntries err: %#v\n", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	jsonResp := ct.GetEntriesResponse{}
+	for _, leaf := range entries {
+		jsonResp.Entries = append(jsonResp.Entries, ct.LeafEntry{
+			LeafInput: leaf.LeafValue,
+			ExtraData: leaf.ExtraData,
+		})
+	}
+	response, err := json.Marshal(&jsonResp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	elapsed := time.Since(startTime)
+	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "%s", response)
 }

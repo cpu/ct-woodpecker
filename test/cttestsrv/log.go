@@ -152,7 +152,7 @@ func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofRe
 
 	nodeFetches, err := merkle.CalcConsistencyProofNodeAddresses(first, second, int64(root.TreeSize), 64)
 	if err != nil {
-		fmt.Printf("\n\n!!!! CalcConsistencyProof err %s !!!!\n\n", err)
+		fmt.Printf("\n\n!!!! CalcConsistencyProof err: first %d, second %d, error: %s error raw: %#v !!!!\n\n", first, second, err, err)
 		return nil, err
 	}
 
@@ -344,12 +344,6 @@ func (t *testLog) addChain(req []string, precert bool) error {
 		return err
 	}
 
-	/*
-		fmt.Printf("The MerkleTreeLeaf is: %#v\n", leaf)
-		fmt.Printf("The TimestampedEntry is: %#v\n", leaf.TimestampedEntry)
-		fmt.Printf("The X509Entry is: %#v\n", leaf.TimestampedEntry.X509Entry)
-	*/
-
 	// TODO(@cpu): Should use a better prefix here for the logging done by
 	// util.BuildLogLeaf. Maybe the bind addr? Pubkey?
 	logPrefix := "ct-test-srv"
@@ -358,7 +352,6 @@ func (t *testLog) addChain(req []string, precert bool) error {
 		fmt.Printf("Err: %#v\n", err)
 		return err
 	}
-	//fmt.Printf("The LogLeaf is: %#v\n", logLeaf)
 
 	leafHash, err := t.hasher.HashLeaf(logLeaf.LeafValue)
 	if err != nil {
@@ -366,11 +359,8 @@ func (t *testLog) addChain(req []string, precert bool) error {
 	}
 	logLeaf.MerkleLeafHash = leafHash
 	logLeaf.LeafIdentityHash = logLeaf.MerkleLeafHash
-	//fmt.Printf("The LogLeaf hash is: %#v\n", leafHash)
 
 	leaves := []*trillian.LogLeaf{&logLeaf}
-	//fmt.Printf("Leaves: %#v\n", leaves)
-
 	resp, err := t.logStorage.QueueLeaves(context.Background(), t.tree, leaves, timeSource.Now())
 	if err != nil {
 		return err
@@ -387,4 +377,26 @@ func (t *testLog) addChain(req []string, precert bool) error {
 	}
 	fmt.Printf("integrated %d leaves\n", integratedCount)
 	return nil
+}
+
+func (t *testLog) getEntries(start, end int64) ([]*trillian.LogLeaf, error) {
+	tx, err := t.logStorage.SnapshotForTree(context.Background(), t.tree)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Close()
+
+	slr, err := tx.LatestSignedLogRoot(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	var root types.LogRootV1
+	if err := root.UnmarshalBinary(slr.LogRoot); err != nil {
+		return nil, err
+	}
+	if start >= int64(root.TreeSize) {
+		return nil, fmt.Errorf("start index %d is larger than tree size %d\n", start, root.TreeSize)
+	}
+
+	return tx.GetLeavesByRange(context.Background(), start, end-start)
 }
