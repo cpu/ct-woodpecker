@@ -1,12 +1,15 @@
 package cttestsrv
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/google/certificate-transparency-go"
 )
 
 // getSTHHandler processes GET requests for the CT get-sth endpoint. It returns
@@ -63,15 +66,25 @@ func (is *IntegrationSrv) addChainHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	precert := false
-	if r.URL.Path == "/ct/v1/add-pre-chain" {
-		precert = true
+	chain := make([]ct.ASN1Cert, len(addChainReq.Chain))
+	for i, certBase64 := range addChainReq.Chain {
+		b, err := base64.StdEncoding.DecodeString(certBase64)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		chain[i] = ct.ASN1Cert{Data: b}
 	}
 
 	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
 	start := time.Now()
 
-	resp, err := is.AddChain(addChainReq.Chain, precert)
+	precert := false
+	if r.URL.Path == "/ct/v1/add-pre-chain" {
+		precert = true
+	}
+
+	resp, err := is.AddChain(chain, precert)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

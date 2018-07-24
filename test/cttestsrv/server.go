@@ -59,8 +59,10 @@ type IntegrationSrv struct {
 	// add-chain and add-pre-chain
 	submissions int64
 
-	// sth is the mock SignedTreeHead the server returns for get-sth requests
+	// sth is a mock SignedTreeHead the server returns for get-sth requests when
+	// it is not nil. Otherwise the testLog's real STH is used.
 	sth *ct.SignedTreeHead
+
 	// sthFetches tracks how many times get-sth has been called
 	sthFetches int64
 
@@ -109,6 +111,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	// Test server management endpoints
 	mux.HandleFunc("/integrate", is.integrateHandler)
 	mux.HandleFunc("/set-sth", is.setSTHHandler)
+	mux.HandleFunc("/clear-sth", is.clearSTHHandler)
 	// TODO(@cpu): Provide a set-sct endpoint
 	//mux.HandleFunc("/set-sct", is.setSCTHandler)
 	// TODO(@cpu): Provide a function to switch the testlog tree?
@@ -157,9 +160,17 @@ func (is *IntegrationSrv) GetSTH() (*ct.GetSTHResponse, error) {
 	// Track that an STH was fetched
 	atomic.AddInt64(&is.sthFetches, 1)
 
-	sth, err := is.log.getSTH()
-	if err != nil {
-		return nil, err
+	// If there is a mock STH, use it
+	var sth *ct.SignedTreeHead
+	var err error
+	if is.sth != nil {
+		sth = is.sth
+	} else {
+		// Otherwise, get the testlog's STH and use it
+		sth, err = is.log.getSTH()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	marshaledSig, err := cttls.Marshal(sth.TreeHeadSignature)
@@ -222,8 +233,7 @@ func (is *IntegrationSrv) GetConsistencyProof(first, second int64) (*ct.GetSTHCo
 // function blocks for a variable amount of time based on the latencySchedule
 // and the current latencyItem index. It is safe to call concurrently.
 // TODO(@cpu): update this comment
-// TODO(@cpu): Change chain argument to something better
-func (is *IntegrationSrv) AddChain(chain []string, precert bool) (*ct.AddChainResponse, error) {
+func (is *IntegrationSrv) AddChain(chain []ct.ASN1Cert, precert bool) (*ct.AddChainResponse, error) {
 	is.sleep()
 
 	is.Lock()

@@ -48,6 +48,16 @@ func (is *IntegrationSrv) setSTHHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
+func (is *IntegrationSrv) clearSTHHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.NotFound(w, r)
+		return
+	}
+
+	is.SetSTH(nil)
+	w.WriteHeader(http.StatusOK)
+}
+
 // integrateHandler accepts GET requests indicating the testLog should sequence
 // a batch of unintegrated leaves that have been submitted through the add
 // chains endpoint. The number of sequenced leaves is returned as the HTTP

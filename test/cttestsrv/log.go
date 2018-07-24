@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -312,16 +311,7 @@ func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
 	return &sth, nil
 }
 
-func (t *testLog) addChain(req []string, precert bool) (*ct.SignedCertificateTimestamp, error) {
-	chain := make([]ct.ASN1Cert, len(req))
-	for i, certBase64 := range req {
-		b, err := base64.StdEncoding.DecodeString(certBase64)
-		if err != nil {
-			return nil, err
-		}
-		chain[i] = ct.ASN1Cert{Data: b}
-	}
-
+func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertificateTimestamp, error) {
 	// Generate the internal leaf entry for the SCT
 	entryType := ct.X509LogEntryType
 	if precert {
