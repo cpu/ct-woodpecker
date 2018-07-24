@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/certificate-transparency-go"
+	cttls "github.com/google/certificate-transparency-go/tls"
 )
 
 // Personality describes the configuration & behaviour of a test CT
@@ -110,6 +111,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	mux.HandleFunc("/ct/v1/get-sth-consistency", is.getConsistencyHandler)
 	mux.HandleFunc("/ct/v1/get-entries", is.getEntriesHandler)
 	// management handlers
+	mux.HandleFunc("/integrate", is.integrateHandler)
 	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/set-sth", is.setSTHHandler)
 	mux.HandleFunc("/sth-fetches", is.getSTHFetchesHandler)
@@ -149,19 +151,31 @@ func (is *IntegrationSrv) sleep() {
 // (or an error). The submissions count will be incremented as a result. This
 // function blocks for a variable amount of time based on the latencySchedule
 // and the current latencyItem index. It is safe to call concurrently.
-func (is *IntegrationSrv) addChain(chain []string, precert bool) ([]byte, error) {
+func (is *IntegrationSrv) addChain(chain []string, precert bool) (*ct.AddChainResponse, error) {
 	if len(chain) == 0 {
 		return nil, errors.New("chain argument must have len >= 1")
 	}
 
 	is.sleep()
-	err := is.log.addChain(chain, precert)
+	sct, err := is.log.addChain(chain, precert)
 	if err != nil {
 		return nil, err
 	}
 
 	atomic.AddInt64(&is.submissions, 1)
-	return createTestingSignedSCT(chain, is.key, precert, time.Now()), nil
+
+	sigBytes, err := cttls.Marshal(sct.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ct.AddChainResponse{
+		SCTVersion: sct.SCTVersion,
+		ID:         sct.LogID.KeyID[:],
+		Timestamp:  sct.Timestamp,
+		Extensions: base64.StdEncoding.EncodeToString(sct.Extensions),
+		Signature:  sigBytes,
+	}, nil
 }
 
 // addChainHandler handles a HTTP POST for the add-chain and add-pre-chain CT
@@ -194,7 +208,11 @@ func (is *IntegrationSrv) addChainHandler(w http.ResponseWriter, r *http.Request
 	start := time.Now()
 	sct, err := is.addChain(addChainReq.Chain, precert)
 	if err != nil {
-		fmt.Printf("ERROR: %#v\n", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sctBytes, err := json.Marshal(sct)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -202,14 +220,32 @@ func (is *IntegrationSrv) addChainHandler(w http.ResponseWriter, r *http.Request
 	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
 
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(sct)
-
+	_, _ = w.Write(sctBytes)
 }
 
 // Submissions returns the number of add-chain/add-pre-chain requests processed
 // so far. It is safe to call concurrently.
 func (is *IntegrationSrv) Submissions() int64 {
 	return atomic.LoadInt64(&is.submissions)
+}
+
+func (is *IntegrationSrv) integrateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.NotFound(w, r)
+		return
+	}
+
+	count, err := is.log.integrateBatch()
+	if err != nil {
+		fmt.Printf("ERROR: %#v\n", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "%d", count)
+	is.logger.Printf("%s %s request completed.", is.Addr, r.URL.Path)
 }
 
 // getSubmissions handler allows fetching the number of add-chain/add-pre-chain

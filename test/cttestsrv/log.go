@@ -13,6 +13,7 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/certificate-transparency-go"
 	cttls "github.com/google/certificate-transparency-go/tls"
+	ctfe "github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/trillian/util"
 	"github.com/google/trillian"
 	tcrypto "github.com/google/trillian/crypto"
@@ -324,12 +325,12 @@ func (t *testLog) getSTH() (*ct.GetSTHResponse, error) {
 	}, nil
 }
 
-func (t *testLog) addChain(req []string, precert bool) error {
+func (t *testLog) addChain(req []string, precert bool) (*ct.SignedCertificateTimestamp, error) {
 	chain := make([]ct.ASN1Cert, len(req))
 	for i, certBase64 := range req {
 		b, err := base64.StdEncoding.DecodeString(certBase64)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		chain[i] = ct.ASN1Cert{Data: b}
 	}
@@ -339,9 +340,12 @@ func (t *testLog) addChain(req []string, precert bool) error {
 	if precert {
 		entryType = ct.PrecertLogEntryType
 	}
-	leaf, err := ct.MerkleTreeLeafFromRawChain(chain, entryType, 0)
+
+	now := timeSource.Now()
+	timeMillis := uint64(now.UnixNano() / (1000 * 1000))
+	leaf, err := ct.MerkleTreeLeafFromRawChain(chain, entryType, timeMillis)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// TODO(@cpu): Should use a better prefix here for the logging done by
@@ -349,34 +353,88 @@ func (t *testLog) addChain(req []string, precert bool) error {
 	logPrefix := "ct-test-srv"
 	logLeaf, err := util.BuildLogLeaf(logPrefix, *leaf, 0, chain[0], chain[1:], precert)
 	if err != nil {
-		fmt.Printf("Err: %#v\n", err)
-		return err
+		return nil, err
 	}
 
 	leafHash, err := t.hasher.HashLeaf(logLeaf.LeafValue)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logLeaf.MerkleLeafHash = leafHash
 	logLeaf.LeafIdentityHash = logLeaf.MerkleLeafHash
 
 	leaves := []*trillian.LogLeaf{&logLeaf}
-	resp, err := t.logStorage.QueueLeaves(context.Background(), t.tree, leaves, timeSource.Now())
+	queuedLeaves, err := t.logStorage.QueueLeaves(context.Background(), t.tree, leaves, now)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	fmt.Printf("queued %d leaves\n", len(resp))
+	fmt.Printf("queued %d leaves\n", len(queuedLeaves))
 
+	if len(queuedLeaves) != 1 {
+		return nil, fmt.Errorf("called QueueLeaves with 1 leaf, got back %d", len(queuedLeaves))
+	}
+
+	queuedLeaf := queuedLeaves[0]
+	var loggedLeaf ct.MerkleTreeLeaf
+	rest, err := cttls.Unmarshal(queuedLeaf.Leaf.LeafValue, &loggedLeaf)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("unmarshaling logged leaf left %d bytes unaccounted for", len(rest))
+	}
+
+	tbsSCT := ct.SignedCertificateTimestamp{
+		SCTVersion: ct.V1,
+		Timestamp:  loggedLeaf.TimestampedEntry.Timestamp,
+		Extensions: loggedLeaf.TimestampedEntry.Extensions,
+	}
+
+	tbsSCTBytes, err := ct.SerializeSCTSignatureInput(tbsSCT, ct.LogEntry{Leaf: loggedLeaf})
+	if err != nil {
+		return nil, err
+	}
+
+	h := sha256.Sum256(tbsSCTBytes)
+	signature, err := t.key.Sign(rand.Reader, h[:], crypto.SHA256)
+	if err != nil {
+		return nil, err
+	}
+
+	ds := ct.DigitallySigned{
+		Algorithm: cttls.SignatureAndHashAlgorithm{
+			Hash:      cttls.SHA256,
+			Signature: cttls.SignatureAlgorithmFromPubKey(t.key.Public()),
+		},
+		Signature: signature,
+	}
+
+	logID, err := ctfe.GetCTLogID(t.key.Public())
+	if err != nil {
+		return nil, err
+	}
+
+	sct := &ct.SignedCertificateTimestamp{
+		SCTVersion: tbsSCT.SCTVersion,
+		Timestamp:  tbsSCT.Timestamp,
+		Extensions: tbsSCT.Extensions,
+		LogID:      ct.LogID{KeyID: logID},
+		Signature:  ds,
+	}
+	return sct, nil
+}
+
+func (t *testLog) integrateBatch() (int, error) {
 	maxRootDuration, err := ptypes.Duration(t.tree.MaxRootDuration)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	integratedCount, err := t.sequencer.IntegrateBatch(context.Background(), t.tree, 50, time.Duration(0), maxRootDuration)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	fmt.Printf("integrated %d leaves\n", integratedCount)
-	return nil
+	return integratedCount, nil
 }
 
 func (t *testLog) getEntries(start, end int64) ([]*trillian.LogLeaf, error) {
