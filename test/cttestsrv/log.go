@@ -40,7 +40,6 @@ var (
 
 type testLog struct {
 	tree *trillian.Tree
-	root *trillian.SignedLogRoot
 
 	key    *ecdsa.PrivateKey
 	hasher hashers.LogHasher
@@ -124,7 +123,6 @@ func newLog(key *ecdsa.PrivateKey, pubKeyBytes []byte) (*testLog, error) {
 
 	return &testLog{
 		tree: tree,
-		root: root,
 
 		key:    key,
 		hasher: hasher,
@@ -270,7 +268,7 @@ func fetchNodes(ctx context.Context, tx storage.NodeReader, treeRevision int64, 
 	return proofNodes, nil
 }
 
-func (t *testLog) getSTH() (*ct.GetSTHResponse, error) {
+func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
 	tx, err := t.logStorage.SnapshotForTree(context.Background(), t.tree)
 	if err != nil {
 		return nil, err
@@ -311,18 +309,7 @@ func (t *testLog) getSTH() (*ct.GetSTHResponse, error) {
 		},
 		Signature: signature,
 	}
-
-	marshaledSig, err := cttls.Marshal(sth.TreeHeadSignature)
-	if err != nil {
-		return nil, err
-	}
-
-	return &ct.GetSTHResponse{
-		TreeSize:          sth.TreeSize,
-		SHA256RootHash:    sth.SHA256RootHash[:],
-		Timestamp:         sth.Timestamp,
-		TreeHeadSignature: marshaledSig,
-	}, nil
+	return &sth, nil
 }
 
 func (t *testLog) addChain(req []string, precert bool) (*ct.SignedCertificateTimestamp, error) {
@@ -368,7 +355,6 @@ func (t *testLog) addChain(req []string, precert bool) (*ct.SignedCertificateTim
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("queued %d leaves\n", len(queuedLeaves))
 
 	if len(queuedLeaves) != 1 {
 		return nil, fmt.Errorf("called QueueLeaves with 1 leaf, got back %d", len(queuedLeaves))
@@ -433,7 +419,6 @@ func (t *testLog) integrateBatch() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	fmt.Printf("integrated %d leaves\n", integratedCount)
 	return integratedCount, nil
 }
 

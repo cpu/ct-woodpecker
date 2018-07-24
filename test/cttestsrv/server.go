@@ -5,13 +5,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,7 +64,7 @@ type IntegrationSrv struct {
 	// sthFetches tracks how many times get-sth has been called
 	sthFetches int64
 
-	// TODO(@cpu): Comment, consider better name?
+	// testLog is an in-memory Trillian CT log tailored for testing ct-woodpecker
 	log *testLog
 }
 
@@ -104,19 +100,33 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 		log: testLog,
 	}
 	mux := http.NewServeMux()
-	// ct handlers
-	mux.HandleFunc("/ct/v1/add-pre-chain", is.addChainHandler)
-	mux.HandleFunc("/ct/v1/add-chain", is.addChainHandler)
-	mux.HandleFunc("/ct/v1/get-sth", is.getSTHHandler)
-	mux.HandleFunc("/ct/v1/get-sth-consistency", is.getConsistencyHandler)
-	mux.HandleFunc("/ct/v1/get-entries", is.getEntriesHandler)
-	// management handlers
+	// Certificate Transparency Log API endpoints
+	mux.HandleFunc(ct.AddPreChainPath, is.addChainHandler)
+	mux.HandleFunc(ct.AddChainPath, is.addChainHandler)
+	mux.HandleFunc(ct.GetSTHPath, is.getSTHHandler)
+	mux.HandleFunc(ct.GetSTHConsistencyPath, is.getConsistencyHandler)
+	mux.HandleFunc(ct.GetEntriesPath, is.getEntriesHandler)
+	// Test server management endpoints
 	mux.HandleFunc("/integrate", is.integrateHandler)
-	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/set-sth", is.setSTHHandler)
+	// TODO(@cpu): Provide a set-sct endpoint
+	//mux.HandleFunc("/set-sct", is.setSCTHandler)
+	// TODO(@cpu): Provide a function to switch the testlog tree?
+	//mux.HandleFunc("/switch-trees", is.switchTreeHandler)
+	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/sth-fetches", is.getSTHFetchesHandler)
 	is.server.Handler = mux
 	return is, nil
+}
+
+func (is *IntegrationSrv) sleep() {
+	if is.latencySchedule != nil {
+		is.Lock()
+		sleepTime := time.Duration(is.latencySchedule[is.latencyItem%len(is.latencySchedule)]) * time.Second
+		is.latencyItem++
+		is.Unlock()
+		time.Sleep(sleepTime)
+	}
 }
 
 // Run starts an IntegrationSrv instance by calling ListenAndServe on the
@@ -137,33 +147,101 @@ func (is *IntegrationSrv) Shutdown() {
 	_ = is.server.Shutdown(context.Background())
 }
 
-func (is *IntegrationSrv) sleep() {
-	if is.latencySchedule != nil {
-		is.Lock()
-		sleepTime := time.Duration(is.latencySchedule[is.latencyItem%len(is.latencySchedule)]) * time.Second
-		is.latencyItem++
-		is.Unlock()
-		time.Sleep(sleepTime)
-	}
-}
-
-// addChain returns the raw bytes of a signed testing SCT for the given chain
-// (or an error). The submissions count will be incremented as a result. This
-// function blocks for a variable amount of time based on the latencySchedule
-// and the current latencyItem index. It is safe to call concurrently.
-func (is *IntegrationSrv) addChain(chain []string, precert bool) (*ct.AddChainResponse, error) {
-	if len(chain) == 0 {
-		return nil, errors.New("chain argument must have len >= 1")
-	}
-
+// TODO(@cpu): Comment this
+func (is *IntegrationSrv) GetSTH() (*ct.GetSTHResponse, error) {
 	is.sleep()
-	sct, err := is.log.addChain(chain, precert)
+
+	is.RLock()
+	defer is.RUnlock()
+
+	// Track that an STH was fetched
+	atomic.AddInt64(&is.sthFetches, 1)
+
+	sth, err := is.log.getSTH()
 	if err != nil {
 		return nil, err
 	}
 
-	atomic.AddInt64(&is.submissions, 1)
+	marshaledSig, err := cttls.Marshal(sth.TreeHeadSignature)
+	if err != nil {
+		return nil, err
+	}
 
+	curSTHResp := &ct.GetSTHResponse{
+		TreeSize:          sth.TreeSize,
+		SHA256RootHash:    sth.SHA256RootHash[:],
+		Timestamp:         sth.Timestamp,
+		TreeHeadSignature: marshaledSig,
+	}
+	return curSTHResp, nil
+}
+
+// TODO(@cpu): Comment this shit
+func (is *IntegrationSrv) GetEntries(start, end int64) (*ct.GetEntriesResponse, error) {
+	is.sleep()
+
+	is.RLock()
+	defer is.RUnlock()
+
+	is.logger.Printf("Getting entries from %d to %d (%d entries)", start, end, (end - start))
+	entries, err := is.log.getEntries(start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := ct.GetEntriesResponse{}
+	for _, leaf := range entries {
+		resp.Entries = append(resp.Entries, ct.LeafEntry{
+			LeafInput: leaf.LeafValue,
+			ExtraData: leaf.ExtraData,
+		})
+	}
+
+	return &resp, nil
+}
+
+func (is *IntegrationSrv) GetConsistencyProof(first, second int64) (*ct.GetSTHConsistencyResponse, error) {
+	is.sleep()
+
+	is.RLock()
+	defer is.RUnlock()
+
+	is.logger.Printf("Getting consistency proof from %d to %d", first, second)
+	proof, err := is.log.getProof(first, second)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ct.GetSTHConsistencyResponse{
+		Consistency: proof.Proof.Hashes,
+	}, nil
+}
+
+// AddChain returns a ct.AddChainResponse with an SCT for the provided chain
+// (or an error). The submissions count will be incremented as a result. This
+// function blocks for a variable amount of time based on the latencySchedule
+// and the current latencyItem index. It is safe to call concurrently.
+// TODO(@cpu): update this comment
+// TODO(@cpu): Change chain argument to something better
+func (is *IntegrationSrv) AddChain(chain []string, precert bool) (*ct.AddChainResponse, error) {
+	is.sleep()
+
+	is.Lock()
+	defer is.Unlock()
+
+	if len(chain) == 0 {
+		return nil, errors.New("chain argument must have len >= 1")
+	}
+
+	// Add the chain to the test log, getting back an SCT
+	sct, err := is.log.addChain(chain, precert)
+	if err != nil {
+		return nil, err
+	}
+	atomic.AddInt64(&is.submissions, 1)
+	is.logger.Printf("Queued 1 new chain. %d total submissions.", atomic.LoadInt64(&is.submissions))
+
+	// Marshal the SCT's digitally signed signature struct to raw bytes
 	sigBytes, err := cttls.Marshal(sct.Signature)
 	if err != nil {
 		return nil, err
@@ -178,126 +256,6 @@ func (is *IntegrationSrv) addChain(chain []string, precert bool) (*ct.AddChainRe
 	}, nil
 }
 
-// addChainHandler handles a HTTP POST for the add-chain and add-pre-chain CT
-// endpoint.
-func (is *IntegrationSrv) addChainHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.NotFound(w, r)
-		return
-	}
-	bodyBytes, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	var addChainReq struct {
-		Chain []string
-	}
-	err = json.Unmarshal(bodyBytes, &addChainReq)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	precert := false
-	if r.URL.Path == "/ct/v1/add-pre-chain" {
-		precert = true
-	}
-
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	start := time.Now()
-	sct, err := is.addChain(addChainReq.Chain, precert)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	sctBytes, err := json.Marshal(sct)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	elapsed := time.Since(start)
-	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(sctBytes)
-}
-
-// Submissions returns the number of add-chain/add-pre-chain requests processed
-// so far. It is safe to call concurrently.
-func (is *IntegrationSrv) Submissions() int64 {
-	return atomic.LoadInt64(&is.submissions)
-}
-
-func (is *IntegrationSrv) integrateHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.NotFound(w, r)
-		return
-	}
-
-	count, err := is.log.integrateBatch()
-	if err != nil {
-		fmt.Printf("ERROR: %#v\n", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%d", count)
-	is.logger.Printf("%s %s request completed.", is.Addr, r.URL.Path)
-}
-
-// getSubmissions handler allows fetching the number of add-chain/add-pre-chain
-// requests processed so far using an HTTP GET request.
-func (is *IntegrationSrv) getSubmissionsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.NotFound(w, r)
-		return
-	}
-
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%d", is.Submissions())
-	is.logger.Printf("%s %s request completed.", is.Addr, r.URL.Path)
-}
-
-// getSTHHandler processes GET requests for the CT get-sth endpoint. It returns
-// the server's current mock STH. The number of sthFetches seen by the server is
-// incremented as a result of processing the request.
-func (is *IntegrationSrv) getSTHHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.NotFound(w, r)
-		return
-	}
-
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	start := time.Now()
-	is.sleep()
-	// Track that an STH was fetched
-	atomic.AddInt64(&is.sthFetches, 1)
-
-	is.RLock()
-	defer is.RUnlock()
-
-	curSTHResp, err := is.log.getSTH()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	response, err := json.Marshal(&curSTHResp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	elapsed := time.Since(start)
-	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%s", response)
-}
-
 // SetSTH allows setting the server's mock STH. It is safe to call concurrently.
 func (is *IntegrationSrv) SetSTH(mockSTH *ct.SignedTreeHead) {
 	_ = signSTH(is.key, mockSTH)
@@ -306,163 +264,25 @@ func (is *IntegrationSrv) SetSTH(mockSTH *ct.SignedTreeHead) {
 	is.sth = mockSTH
 }
 
-// SetSTHHandler allows setting the server's mock STH through a HTTP POST
-// request.
-func (is *IntegrationSrv) setSTHHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.NotFound(w, r)
-		return
-	}
-	msg, err := ioutil.ReadAll(r.Body)
+// TODO(@cpu): Comment this
+func (is *IntegrationSrv) Integrate() (int, error) {
+	count, err := is.log.integrateBatch()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return 0, err
 	}
 
-	var mockSTH struct {
-		TreeSize  uint64 `json:"tree_size"`
-		Timestamp uint64
-		RootHash  string `json:"sha256_root_hash"`
-	}
-	err = json.Unmarshal(msg, &mockSTH)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	is.logger.Printf("Integrated %d new leave(s)", count)
+	return count, nil
+}
 
-	var root ct.SHA256Hash
-	err = root.FromBase64String(mockSTH.RootHash)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	sth := &ct.SignedTreeHead{
-		TreeSize:       mockSTH.TreeSize,
-		Timestamp:      mockSTH.Timestamp,
-		SHA256RootHash: root,
-	}
-	is.SetSTH(sth)
-	w.WriteHeader(http.StatusOK)
+// Submissions returns the number of add-chain/add-pre-chain requests processed
+// so far. It is safe to call concurrently.
+func (is *IntegrationSrv) Submissions() int64 {
+	return atomic.LoadInt64(&is.submissions)
 }
 
 // STHFetches returns the number of get-sth requests processed by the server so
 // far. It is safe to call concurrently.
 func (is *IntegrationSrv) STHFetches() int64 {
 	return atomic.LoadInt64(&is.sthFetches)
-}
-
-// getSTHFetchesHandler allows fetching the number of get-sth requests processed
-// by the server so far by sending a HTTP GET request.
-func (is *IntegrationSrv) getSTHFetchesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.NotFound(w, r)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%d", is.STHFetches())
-}
-
-func (is *IntegrationSrv) getConsistencyHandler(w http.ResponseWriter, r *http.Request) {
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	start := time.Now()
-
-	firstArgs, ok := r.URL.Query()["first"]
-	if !ok || len(firstArgs) < 1 {
-		http.Error(w, "no first parameter", http.StatusBadRequest)
-		return
-	}
-	secondArgs, ok := r.URL.Query()["second"]
-	if !ok || len(secondArgs) < 1 {
-		http.Error(w, "no second parameter", http.StatusBadRequest)
-		return
-	}
-
-	first, err := strconv.ParseInt(firstArgs[0], 10, 64)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	second, err := strconv.ParseInt(secondArgs[0], 10, 64)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	proof, err := is.log.getProof(first, second)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	jsonResp := ct.GetSTHConsistencyResponse{
-		Consistency: proof.Proof.Hashes,
-	}
-
-	response, err := json.Marshal(&jsonResp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	elapsed := time.Since(start)
-	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%s", response)
-}
-
-func (is *IntegrationSrv) getEntriesHandler(w http.ResponseWriter, r *http.Request) {
-	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
-	startTime := time.Now()
-
-	startArgs, ok := r.URL.Query()["start"]
-	if !ok || len(startArgs) < 1 {
-		http.Error(w, "no start parameter", http.StatusBadRequest)
-		return
-	}
-	endArgs, ok := r.URL.Query()["end"]
-	if !ok || len(endArgs) < 1 {
-		http.Error(w, "no end parameter", http.StatusBadRequest)
-		return
-	}
-
-	start, err := strconv.ParseInt(startArgs[0], 10, 64)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	end, err := strconv.ParseInt(endArgs[0], 10, 64)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	is.logger.Printf("Getting entries from %d to %d (%d entries)", start, end, (end - start))
-
-	entries, err := is.log.getEntries(start, end)
-	if err != nil {
-		fmt.Printf("!!! GetEntries err: %#v\n", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	jsonResp := ct.GetEntriesResponse{}
-	for _, leaf := range entries {
-		jsonResp.Entries = append(jsonResp.Entries, ct.LeafEntry{
-			LeafInput: leaf.LeafValue,
-			ExtraData: leaf.ExtraData,
-		})
-	}
-	response, err := json.Marshal(&jsonResp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	elapsed := time.Since(startTime)
-	is.logger.Printf("%s %s request completed %s later", is.Addr, r.URL.Path, elapsed)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "%s", response)
 }
