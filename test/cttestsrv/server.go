@@ -86,7 +86,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	if err != nil {
 		return nil, err
 	}
-	testLog, err := newLog(key, pubKeyBytes)
+	testLog, err := newLog(key)
 	if err != nil {
 		return nil, err
 	}
@@ -267,11 +267,15 @@ func (is *IntegrationSrv) AddChain(chain []ct.ASN1Cert, precert bool) (*ct.AddCh
 }
 
 // SetSTH allows setting the server's mock STH. It is safe to call concurrently.
-func (is *IntegrationSrv) SetSTH(mockSTH *ct.SignedTreeHead) {
-	_ = signSTH(is.key, mockSTH)
+func (is *IntegrationSrv) SetSTH(mockSTH *ct.SignedTreeHead) error {
 	is.Lock()
 	defer is.Unlock()
+	if err := is.log.signSTH(mockSTH); err != nil {
+		return err
+	}
 	is.sth = mockSTH
+	is.logger.Printf("Set STH to provided mock STH: %#v\n", mockSTH)
+	return nil
 }
 
 // TODO(@cpu): Comment this

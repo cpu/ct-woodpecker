@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"fmt"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	ctfe "github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/trillian/util"
 	"github.com/google/trillian"
-	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/crypto/keyspb"
 	spb "github.com/google/trillian/crypto/sigpb"
@@ -37,20 +37,26 @@ var (
 	timeSource = util.SystemTimeSource{}
 )
 
-type testLog struct {
-	tree *trillian.Tree
+type testTree struct {
+	logStorage storage.LogStorage
+	tree       *trillian.Tree
 
-	key    *ecdsa.PrivateKey
-	hasher hashers.LogHasher
-	signer *tcrypto.Signer
-
-	logStorage   storage.LogStorage
-	adminStorage storage.AdminStorage
-
+	hasher    hashers.LogHasher
 	sequencer *log.Sequencer
 }
 
-func newLog(key *ecdsa.PrivateKey, pubKeyBytes []byte) (*testLog, error) {
+type testLog struct {
+	key *ecdsa.PrivateKey
+
+	activeTree *testTree
+
+	honestTree *testTree
+	liarTree   *testTree
+
+	adminStorage storage.AdminStorage
+}
+
+func makeTree(name, desc string, key *ecdsa.PrivateKey) (*testTree, error) {
 	keyBytes, err := der.MarshalPrivateKey(key)
 	if err != nil {
 		return nil, err
@@ -63,7 +69,11 @@ func newLog(key *ecdsa.PrivateKey, pubKeyBytes []byte) (*testLog, error) {
 		return nil, err
 	}
 
-	// See https://github.com/google/trillian/blob/master/storage/testonly/admin_storage_tester.go
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+
 	tree := &trillian.Tree{
 		TreeId:             0,
 		TreeState:          trillian.TreeState_ACTIVE,
@@ -71,25 +81,14 @@ func newLog(key *ecdsa.PrivateKey, pubKeyBytes []byte) (*testLog, error) {
 		HashStrategy:       trillian.HashStrategy_RFC6962_SHA256,
 		HashAlgorithm:      spb.DigitallySigned_SHA256,
 		SignatureAlgorithm: spb.DigitallySigned_ECDSA,
-		DisplayName:        "Test Log",
-		Description:        "ct-test-server test log",
+		DisplayName:        name,
+		Description:        desc,
 		PrivateKey:         pk,
 		PublicKey: &keyspb.PublicKey{
 			Der: pubKeyBytes,
 		},
 		MaxRootDuration: ptypes.DurationProto(0 * time.Millisecond),
 	}
-
-	logStorage := memory.NewLogStorage(nil)
-	adminStorage := memory.NewAdminStorage(logStorage)
-
-	// overwrite the tree with the one returned from CreateTree since it will populate a TreeId
-	tree, err = storage.CreateTree(context.Background(), adminStorage, tree)
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("Created in-memory tree with ID: %#v\n", tree.TreeId)
 
 	hasher, err := hashers.NewLogHasher(tree.HashStrategy)
 	if err != nil {
@@ -101,40 +100,81 @@ func newLog(key *ecdsa.PrivateKey, pubKeyBytes []byte) (*testLog, error) {
 		return nil, err
 	}
 
-	// init the new tree by signing a STH for the empty root
-	root, err := signer.SignLogRoot(&types.LogRootV1{
-		RootHash:       hasher.EmptyRoot(),
-		TimestampNanos: uint64(timeSource.Now().UnixNano()),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// store the new STH
-	err = logStorage.ReadWriteTransaction(context.Background(), tree, func(ctx context.Context, tx storage.LogTreeTX) error {
-		return tx.StoreSignedLogRoot(ctx, *root)
-	})
-	if err != nil {
-		return nil, err
-	}
+	logStorage := memory.NewLogStorage(nil)
+	adminStorage := memory.NewAdminStorage(logStorage)
 
 	sequencer := log.NewSequencer(hasher, timeSource, logStorage, signer, nil, quota.Noop())
 
+	// overwrite the tree with the one returned from CreateTree since it will populate a TreeId
+	tree, err = storage.CreateTree(context.Background(), adminStorage, tree)
+	if err != nil {
+		return nil, err
+	}
+
+	tt := &testTree{
+		tree:       tree,
+		logStorage: logStorage,
+		hasher:     hasher,
+		sequencer:  sequencer,
+	}
+
+	// initialize the tree with an empty STH
+	if err := initSTH(tt); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("Created in-memory tree with ID: %#v\n", tree.TreeId)
+	return tt, nil
+}
+
+func initSTH(tt *testTree) error {
+	signer, err := trees.Signer(context.Background(), tt.tree)
+	if err != nil {
+		return err
+	}
+
+	// init the new tree by signing a STH for the empty root
+	root, err := signer.SignLogRoot(&types.LogRootV1{
+		RootHash:       tt.hasher.EmptyRoot(),
+		TimestampNanos: uint64(timeSource.Now().UnixNano()),
+	})
+	if err != nil {
+		return err
+	}
+
+	// store the new STH
+	err = tt.logStorage.ReadWriteTransaction(context.Background(), tt.tree, func(ctx context.Context, tx storage.LogTreeTX) error {
+		return tx.StoreSignedLogRoot(ctx, *root)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func newLog(key *ecdsa.PrivateKey) (*testLog, error) {
+
+	honestTree, err := makeTree("honest", "An honest tree with all elements", key)
+	if err != nil {
+		return nil, err
+	}
+	liarTree, err := makeTree("liar", "A tree missing some elements", key)
+	if err != nil {
+		return nil, err
+	}
+
 	return &testLog{
-		tree: tree,
+		activeTree: honestTree,
+		honestTree: honestTree,
+		liarTree:   liarTree,
 
-		key:    key,
-		hasher: hasher,
-		signer: signer,
-
-		logStorage:   logStorage,
-		adminStorage: adminStorage,
-		sequencer:    sequencer,
+		key: key,
 	}, nil
 }
 
 func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofResponse, error) {
-	tx, err := t.logStorage.SnapshotForTree(context.Background(), t.tree)
+	tx, err := t.activeTree.logStorage.SnapshotForTree(context.Background(), t.activeTree.tree)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +194,7 @@ func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofRe
 		return nil, err
 	}
 
-	proof, err := fetchNodesAndBuildProof(context.Background(), tx, t.hasher, tx.ReadRevision(), 0, nodeFetches)
+	proof, err := fetchNodesAndBuildProof(context.Background(), tx, t.activeTree.hasher, tx.ReadRevision(), 0, nodeFetches)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +308,7 @@ func fetchNodes(ctx context.Context, tx storage.NodeReader, treeRevision int64, 
 }
 
 func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
-	tx, err := t.logStorage.SnapshotForTree(context.Background(), t.tree)
+	tx, err := t.activeTree.logStorage.SnapshotForTree(context.Background(), t.activeTree.tree)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +344,7 @@ func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
 	sth.TreeHeadSignature = ct.DigitallySigned{
 		Algorithm: cttls.SignatureAndHashAlgorithm{
 			Hash:      cttls.SHA256,
-			Signature: cttls.SignatureAlgorithmFromPubKey(t.signer.Public()),
+			Signature: cttls.SignatureAlgorithmFromPubKey(t.key.Public()),
 		},
 		Signature: signature,
 	}
@@ -333,7 +373,7 @@ func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertifi
 		return nil, err
 	}
 
-	leafHash, err := t.hasher.HashLeaf(logLeaf.LeafValue)
+	leafHash, err := t.activeTree.hasher.HashLeaf(logLeaf.LeafValue)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +381,7 @@ func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertifi
 	logLeaf.LeafIdentityHash = logLeaf.MerkleLeafHash
 
 	leaves := []*trillian.LogLeaf{&logLeaf}
-	queuedLeaves, err := t.logStorage.QueueLeaves(context.Background(), t.tree, leaves, now)
+	queuedLeaves, err := t.activeTree.logStorage.QueueLeaves(context.Background(), t.activeTree.tree, leaves, now)
 	if err != nil {
 		return nil, err
 	}
@@ -401,19 +441,42 @@ func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertifi
 }
 
 func (t *testLog) integrateBatch() (int, error) {
-	maxRootDuration, err := ptypes.Duration(t.tree.MaxRootDuration)
+	maxRootDuration, err := ptypes.Duration(t.activeTree.tree.MaxRootDuration)
 	if err != nil {
 		return 0, err
 	}
-	integratedCount, err := t.sequencer.IntegrateBatch(context.Background(), t.tree, 50, time.Duration(0), maxRootDuration)
+	integratedCount, err := t.activeTree.sequencer.IntegrateBatch(context.Background(), t.activeTree.tree, 50, time.Duration(0), maxRootDuration)
 	if err != nil {
 		return 0, err
 	}
 	return integratedCount, nil
 }
 
+func (t *testLog) signSTH(sth *ct.SignedTreeHead) error {
+	sthBytes, err := ct.SerializeSTHSignatureInput(*sth)
+	if err != nil {
+		return err
+	}
+
+	hash := sha256.Sum256(sthBytes)
+	signature, err := t.key.Sign(rand.Reader, hash[:], crypto.SHA256)
+	if err != nil {
+		return err
+	}
+
+	sth.TreeHeadSignature = ct.DigitallySigned{
+		Algorithm: cttls.SignatureAndHashAlgorithm{
+			Hash:      cttls.SHA256,
+			Signature: cttls.SignatureAlgorithmFromPubKey(t.key.Public()),
+		},
+		Signature: signature,
+	}
+
+	return nil
+}
+
 func (t *testLog) getEntries(start, end int64) ([]*trillian.LogLeaf, error) {
-	tx, err := t.logStorage.SnapshotForTree(context.Background(), t.tree)
+	tx, err := t.activeTree.logStorage.SnapshotForTree(context.Background(), t.activeTree.tree)
 	if err != nil {
 		return nil, err
 	}
