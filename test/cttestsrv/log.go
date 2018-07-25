@@ -123,7 +123,6 @@ func makeTree(name, desc string, key *ecdsa.PrivateKey) (*testTree, error) {
 		return nil, err
 	}
 
-	fmt.Printf("Created in-memory tree with ID: %#v\n", tree.TreeId)
 	return tt, nil
 }
 
@@ -154,7 +153,6 @@ func initSTH(tt *testTree) error {
 }
 
 func newLog(key *ecdsa.PrivateKey) (*testLog, error) {
-
 	honestTree, err := makeTree("honest", "An honest tree with all elements", key)
 	if err != nil {
 		return nil, err
@@ -173,8 +171,19 @@ func newLog(key *ecdsa.PrivateKey) (*testLog, error) {
 	}, nil
 }
 
+func (t *testLog) switchTrees() *testTree {
+	if t.activeTree == t.honestTree {
+		t.activeTree = t.liarTree
+	} else {
+		t.activeTree = t.honestTree
+	}
+	return t.activeTree
+}
+
 func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofResponse, error) {
 	tx, err := t.activeTree.logStorage.SnapshotForTree(context.Background(), t.activeTree.tree)
+	defer tx.Close()
+
 	if err != nil {
 		return nil, err
 	}
@@ -188,9 +197,16 @@ func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofRe
 		return nil, err
 	}
 
+	if first < 1 || first > int64(root.TreeSize) {
+		return nil, fmt.Errorf("Illegal first value: %d", first)
+	}
+
+	if second < 1 || second < first || second > int64(root.TreeSize) {
+		return nil, fmt.Errorf("Illegal second value: %d", second)
+	}
+
 	nodeFetches, err := merkle.CalcConsistencyProofNodeAddresses(first, second, int64(root.TreeSize), 64)
 	if err != nil {
-		fmt.Printf("\n\n!!!! CalcConsistencyProof err: first %d, second %d, error: %s error raw: %#v !!!!\n\n", first, second, err, err)
 		return nil, err
 	}
 
@@ -210,105 +226,10 @@ func (t *testLog) getProof(first, second int64) (*trillian.GetConsistencyProofRe
 	return resp, nil
 }
 
-func fetchNodesAndBuildProof(ctx context.Context, tx storage.NodeReader, th hashers.LogHasher, treeRevision, leafIndex int64, proofNodeFetches []merkle.NodeFetch) (trillian.Proof, error) {
-	proofNodes, err := fetchNodes(ctx, tx, treeRevision, proofNodeFetches)
-	if err != nil {
-		return trillian.Proof{}, err
-	}
-
-	r := &rehasher{th: th}
-	for i, node := range proofNodes {
-		r.process(node, proofNodeFetches[i])
-	}
-
-	return r.rehashedProof(leafIndex)
-}
-
-// rehasher bundles the rehashing logic into a simple state machine
-type rehasher struct {
-	th         hashers.LogHasher
-	rehashing  bool
-	rehashNode storage.Node
-	proof      [][]byte
-	proofError error
-}
-
-func (r *rehasher) process(node storage.Node, fetch merkle.NodeFetch) {
-	switch {
-	case !r.rehashing && fetch.Rehash:
-		// Start of a rehashing chain
-		r.startRehashing(node)
-
-	case r.rehashing && !fetch.Rehash:
-		// End of a rehash chain, resulting in a rehashed proof node
-		r.endRehashing()
-		// And the current node needs to be added to the proof
-		r.emitNode(node)
-
-	case r.rehashing && fetch.Rehash:
-		// Continue with rehashing, update the node we're recomputing
-		r.rehashNode.Hash = r.th.HashChildren(node.Hash, r.rehashNode.Hash)
-
-	default:
-		// Not rehashing, just pass the node through
-		r.emitNode(node)
-	}
-}
-
-func (r *rehasher) emitNode(node storage.Node) {
-	r.proof = append(r.proof, node.Hash)
-}
-
-func (r *rehasher) startRehashing(node storage.Node) {
-	r.rehashNode = storage.Node{Hash: node.Hash}
-	r.rehashing = true
-}
-
-func (r *rehasher) endRehashing() {
-	if r.rehashing {
-		r.proof = append(r.proof, r.rehashNode.Hash)
-		r.rehashing = false
-	}
-}
-
-func (r *rehasher) rehashedProof(leafIndex int64) (trillian.Proof, error) {
-	r.endRehashing()
-	return trillian.Proof{
-		LeafIndex: leafIndex,
-		Hashes:    r.proof,
-	}, r.proofError
-}
-
-// fetchNodes extracts the NodeIDs from a list of NodeFetch structs and passes them
-// to storage, returning the result after some additional validation checks.
-func fetchNodes(ctx context.Context, tx storage.NodeReader, treeRevision int64, fetches []merkle.NodeFetch) ([]storage.Node, error) {
-	proofNodeIDs := make([]storage.NodeID, 0, len(fetches))
-
-	for _, fetch := range fetches {
-		proofNodeIDs = append(proofNodeIDs, fetch.NodeID)
-	}
-
-	proofNodes, err := tx.GetMerkleNodes(ctx, treeRevision, proofNodeIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(proofNodes) != len(proofNodeIDs) {
-		return nil, fmt.Errorf("expected %d nodes from storage but got %d", len(proofNodeIDs), len(proofNodes))
-	}
-
-	for i, node := range proofNodes {
-		// additional check that the correct node was returned
-		if !node.NodeID.Equivalent(fetches[i].NodeID) {
-			return []storage.Node{}, fmt.Errorf("expected node %v at proof pos %d but got %v", fetches[i], i, node.NodeID)
-		}
-	}
-
-	return proofNodes, nil
-}
-
 func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
 	tx, err := t.activeTree.logStorage.SnapshotForTree(context.Background(), t.activeTree.tree)
+	defer tx.Close()
+
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +273,6 @@ func (t *testLog) getSTH() (*ct.SignedTreeHead, error) {
 }
 
 func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertificateTimestamp, error) {
-	// Generate the internal leaf entry for the SCT
 	entryType := ct.X509LogEntryType
 	if precert {
 		entryType = ct.PrecertLogEntryType
@@ -365,10 +285,7 @@ func (t *testLog) addChain(chain []ct.ASN1Cert, precert bool) (*ct.SignedCertifi
 		return nil, err
 	}
 
-	// TODO(@cpu): Should use a better prefix here for the logging done by
-	// util.BuildLogLeaf. Maybe the bind addr? Pubkey?
-	logPrefix := "ct-test-srv"
-	logLeaf, err := util.BuildLogLeaf(logPrefix, *leaf, 0, chain[0], chain[1:], precert)
+	logLeaf, err := util.BuildLogLeaf("ct-test-srv", *leaf, 0, chain[0], chain[1:], precert)
 	if err != nil {
 		return nil, err
 	}

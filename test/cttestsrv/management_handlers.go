@@ -105,3 +105,16 @@ func (is *IntegrationSrv) getSTHFetchesHandler(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "%d", is.STHFetches())
 }
+
+func (is *IntegrationSrv) switchTreesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.NotFound(w, r)
+		return
+	}
+
+	is.logger.Printf("%s %s request received.", is.Addr, r.URL.Path)
+	_ = is.SwitchTrees()
+	is.logger.Printf("%s %s request completed.", is.Addr, r.URL.Path)
+	w.WriteHeader(http.StatusOK)
+	return
+}

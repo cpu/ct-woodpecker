@@ -114,8 +114,7 @@ func NewServer(p Personality, logger *log.Logger) (*IntegrationSrv, error) {
 	mux.HandleFunc("/clear-sth", is.clearSTHHandler)
 	// TODO(@cpu): Provide a set-sct endpoint
 	//mux.HandleFunc("/set-sct", is.setSCTHandler)
-	// TODO(@cpu): Provide a function to switch the testlog tree?
-	//mux.HandleFunc("/switch-trees", is.switchTreeHandler)
+	mux.HandleFunc("/switch-trees", is.switchTreesHandler)
 	mux.HandleFunc("/submissions", is.getSubmissionsHandler)
 	mux.HandleFunc("/sth-fetches", is.getSTHFetchesHandler)
 	is.server.Handler = mux
@@ -148,6 +147,13 @@ func (is *IntegrationSrv) Run() {
 func (is *IntegrationSrv) Shutdown() {
 	is.logger.Printf("Stopping server on %s", is.Addr)
 	_ = is.server.Shutdown(context.Background())
+}
+
+// TODO(@cpu): Comment this
+func (is *IntegrationSrv) SwitchTrees() string {
+	newTree := is.log.switchTrees()
+	is.logger.Printf("Switched backing tree to %s", newTree.tree.DisplayName)
+	return newTree.tree.DisplayName
 }
 
 // TODO(@cpu): Comment this
